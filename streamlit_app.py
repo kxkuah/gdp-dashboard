@@ -1,151 +1,131 @@
 import streamlit as st
 import pandas as pd
-import math
+import numpy as np
+from scipy.optimize import minimize
+import matplotlib.pyplot as plt
 from pathlib import Path
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='Alloying dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
-
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
-
+# Load your data (replace this with actual data loading)
 @st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+def load_data():
+   # df = pd.read_csv('alloy.csv', index_col=0)  # Assume index is alloy names
+    
+    DATA_FILENAME = Path(__file__).parent/'data/alloy.csv'
+    df = pd.read_csv(DATA_FILENAME, index_col=0)
+    return df, list(df.columns)
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+df, parameter_names = load_data()
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+# --- Streamlit UI ---
+st.set_page_config(page_title='Alloy Optimizer', page_icon=':wrench:')
+st.title("🔧 Alloy Composition Optimizer")
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+target_alloy = st.selectbox("Select Target Alloy", df.index)
+fixed_alloys = st.multiselect("Select Fixed Alloys", [a for a in df.index if a != target_alloy])
+n_additional = st.number_input("Number of Additional Contributing Alloys", min_value=1, max_value=10, value=2, step=1)
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+if st.button("Run Optimization"):
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+    target_vector = df.loc[target_alloy].values
+    candidate_alloys = [a for a in df.index if a not in fixed_alloys and a != target_alloy]
 
-    return gdp_df
+    # Step 1: Global optimization
+    X_fixed = df.loc[fixed_alloys].values.T if fixed_alloys else np.empty((df.shape[1], 0))
+    X_candidates = df.loc[candidate_alloys].values.T
+    X_full = np.hstack([X_fixed, X_candidates])
 
-gdp_df = get_gdp_data()
+    num_fixed = len(fixed_alloys)
+    num_candidates = len(candidate_alloys)
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+    x0 = np.ones(num_fixed + num_candidates) / (num_fixed + num_candidates)
+    bounds = [(0, 1)] * (num_fixed + num_candidates)
+    constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+    def loss(w):
+        return np.linalg.norm(X_full @ w - target_vector)
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+    result = minimize(loss, x0, bounds=bounds, constraints=constraints)
 
-# Add some spacing
-''
-''
+    if not result.success:
+        st.error("Initial optimization failed.")
+    else:
+        full_weights = result.x
+        candidate_weights = full_weights[num_fixed:]
+        sorted_indices = np.argsort(candidate_weights)[::-1]
+        sorted_candidates = [candidate_alloys[i] for i in sorted_indices]
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+        # Step 2: Iterative selection
+        selected_alloys = []
+        i = 0
+        while len(selected_alloys) < n_additional and i < len(sorted_candidates):
+            trial_alloys = fixed_alloys + selected_alloys + [sorted_candidates[i]]
+            X_trial = df.loc[trial_alloys].values.T
+            x0_trial = np.ones(len(trial_alloys)) / len(trial_alloys)
+            bounds_trial = [(0, 1)] * len(trial_alloys)
+            constraints_trial = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
+            def loss_trial(w):
+                return np.linalg.norm(X_trial @ w - target_vector)
 
-countries = gdp_df['Country Code'].unique()
+            result_trial = minimize(loss_trial, x0_trial, bounds=bounds_trial, constraints=constraints_trial)
 
-if not len(countries):
-    st.warning("Select at least one country")
+            if result_trial.success and result_trial.x[-1] > 1e-4:
+                selected_alloys.append(sorted_candidates[i])
+            i += 1
 
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
+        # Final optimization
+        final_alloys = fixed_alloys + selected_alloys
+        X_final = df.loc[final_alloys].values.T
+        x0_final = np.ones(len(final_alloys)) / len(final_alloys)
+        bounds_final = [(0, 1)] * len(final_alloys)
+        constraints_final = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
 
-''
-''
-''
+        def loss_final(w):
+            return np.linalg.norm(X_final @ w - target_vector)
 
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
+        result_final = minimize(loss_final, x0_final, bounds=bounds_final, constraints=constraints_final)
 
-st.header('GDP over time', divider='gray')
+        if result_final.success:
+            final_weights = result_final.x
+            combined_vector = X_final @ final_weights
 
-''
+            st.success("Optimization successful!")
+            st.subheader(f"Final Alloy Composition for {target_alloy}")
+            for a, w in zip(final_alloys, final_weights):
+                st.write(f"**{a}**: {w:.4f}")
 
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
+            # Plot
+            actual = target_vector
+            calculated = combined_vector
+            delta = np.abs(actual - calculated)
 
-''
-''
+            exclude_param = "Al"
+            indices_keep = [i for i, p in enumerate(parameter_names) if p != exclude_param]
+            params_filtered = [parameter_names[i] for i in indices_keep]
+            actual_filtered = [actual[i] for i in indices_keep]
+            calculated_filtered = [calculated[i] for i in indices_keep]
+            delta_filtered = [delta[i] for i in indices_keep]
 
+            fig, ax = plt.subplots(figsize=(12, 6))
+            bar_width = 0.35
+            indices = np.arange(len(params_filtered))
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
+            ax.bar(indices, actual_filtered, bar_width, label='Actual', color='skyblue')
+            ax.bar(indices + bar_width, calculated_filtered, bar_width, label='Calculated', color='lightcoral')
+            max_val = max(max(actual_filtered), max(calculated_filtered))
+            ax.set_ylim(0, max_val * 1.15)
 
-st.header(f'GDP in {to_year}', divider='gray')
+            for i in range(len(params_filtered)):
+                y_pos = max(actual_filtered[i], calculated_filtered[i]) + max_val * 0.03
+                ax.text(indices[i] + bar_width / 2, y_pos, f"Δ={delta_filtered[i]:.3f}",
+                        ha='center', va='bottom', fontsize=8, rotation=20)
 
-''
+            ax.set_xticks(indices + bar_width / 2)
+            ax.set_xticklabels(params_filtered, rotation=45)
+            ax.set_ylabel('Parameter Value')
+            ax.set_title(f'Actual vs Calculated for {target_alloy} using {", ".join(final_alloys)}')
+            ax.legend()
+            st.pyplot(fig)
 
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
         else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+            st.error("Final optimization failed.")
